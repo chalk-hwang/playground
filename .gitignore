@@ -1,0 +1,4 @@
+.DS_Store
+.env
+shared/certs
+apps/traefik/acme.json

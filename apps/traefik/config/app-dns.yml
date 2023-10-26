@@ -1,0 +1,13 @@
+http:
+  routers:
+    dns-rtr:
+      rule: "Host(`dns.chalk-playground.space`)"
+      entryPoints:
+        - https
+      service: dns-svc
+
+  services:
+    dns-svc:
+      loadBalancer:
+        servers:
+          - url: "https://10.0.4.2"

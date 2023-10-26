@@ -1,0 +1,238 @@
+---
+name: chalk-playground
+version: "3.9"
+
+volumes:
+  traefik-log: {}
+  tailscale-relay-state: {}
+  portainer-data: {}
+  uptime-kuma-data: {}
+  code-server-config: {}
+  code-server-tailscale: {}
+  code-server-workspaces: {}
+
+services:
+  traefik:
+    container_name: traefik
+    image: traefik:v3.0
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - 8082:8082
+      - 80:80
+      - 443:443
+    volumes:
+      - ./apps/traefik/traefik.yml:/traefik.yml:ro
+      - ./apps/traefik/acme.json:/acme.json
+      - ./apps/traefik/config:/config:ro
+      - traefik-log:/var/log/traefik
+    networks:
+      traefik-proxy:
+        ipv4_address: 10.101.100.100
+      docker-proxy:
+      cf-tunnel:
+      ts-relay:
+        ipv4_address: 10.101.110.110
+    restart: unless-stopped
+    environment:
+      - TZ
+      - DOMAIN_NAME # Passing the domain name to traefik container to be able to use the variable in rules.
+      - CF_API_EMAIL
+      - CF_API_KEY
+    labels:
+      - traefik.enable=true
+      # HTTP-to-HTTPS Redirect
+      - traefik.http.routers.http-catchall.entrypoints=http
+      - traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)
+      - traefik.http.routers.http-catchall.middlewares=redirect-to-https
+      - traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https
+
+  cloudflared-tunnel:
+    container_name: cloudflared-tunnel
+    image: cloudflare/cloudflared:2023.8.2
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: $CF_TUNNEL_TOKEN
+    networks:
+      cf-tunnel:
+
+  tailscale-relay:
+    container_name: tailscale-relay
+    build: ./builds/tailscale-relay
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    restart: unless-stopped
+    environment:
+      - TS_RELAY_HOSTNAME
+      - TS_RELAY_AUTH_KEY
+      - TS_RELAY_ADVERTISE_ROUTES
+    networks:
+      ts-relay:
+    volumes:
+      - tailscale-relay-state:/var/lib/tailscale:rw
+
+  # Docker Socket Proxy - Security Enchanced Proxy for Docker Socket
+  docker-proxy:
+    container_name: docker-proxy
+    image: tecnativa/docker-socket-proxy
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    networks:
+      docker-proxy:
+        ipv4_address: 10.101.254.254 # You can specify a static IP
+    privileged: true # true for VM. False for unprivileged LXC container.
+    ports:
+      - "127.0.0.1:2375:2375"
+      #  - "$ZEROTIER_IP_CLOUDSERVER:2375:2375" # Port 2375 should only ever get exposed to the internal network. When possible use this line.
+      # I use the next line instead, as I want portainer to manage multiple docker endpoints within my home network.
+      # - "2375:2375" # Do not expose this to the internet with port forwarding
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - LOG_LEVEL=info # debug,info,notice,warning,err,crit,alert,emerg
+      ## Variables match the URL prefix (i.e. AUTH blocks access to /auth/* parts of the API, etc.).
+      # 0 to revoke access.
+      # 1 to grant access.
+      ## Granted by traefik-proxy
+      - EVENTS=1
+      - PING=1
+      - VERSION=1
+      ## Revoked by traefik-proxy
+      # Security critical
+      - AUTH=0
+      - SECRETS=0
+      - POST=1 # Watchtower
+      # Not always needed
+      - BUILD=0
+      - COMMIT=0
+      - CONFIGS=0
+      - CONTAINERS=1 # Traefik, portainer, etc.
+      - DISTRIBUTION=0
+      - EXEC=0
+      - IMAGES=1 # Portainer
+      - INFO=1 # Portainer
+      - NETWORKS=1 # Portainer
+      - NODES=0
+      - PLUGINS=0
+      - SERVICES=1 # Portainer
+      - SESSION=0
+      - SWARM=0
+      - SYSTEM=0
+      - TASKS=1 # Portainer
+      - VOLUMES=1 # Portainer
+
+  whoami:
+    container_name: whoami
+    # A container that exposes an API to show its IP address
+    image: traefik/whoami
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.whoami-rtr.entrypoints=https
+      - traefik.http.routers.whoami-rtr.rule=Host(`whoami.$DOMAIN_NAME`)
+      ## HTTP Services
+      - traefik.http.routers.whoami-rtr.service=whoami-svc
+      - traefik.http.services.whoami-svc.loadbalancer.server.scheme=http
+      - traefik.http.services.whoami-svc.loadbalancer.server.port=80
+    restart: unless-stopped
+    networks:
+      traefik-proxy:
+
+  code-server:
+    image: lscr.io/linuxserver/code-server:latest
+    container_name: code-server
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.code-server-rtr.entrypoints=https
+      - traefik.http.routers.code-server-rtr.rule=Host(`code.$DOMAIN_NAME`)
+      ## HTTP Services
+      - traefik.http.routers.code-server.service=code-server-svc
+      - traefik.http.services.code-server-svc.loadbalancer.server.port=8443
+    restart: unless-stopped
+    volumes:
+      - code-server-config:/config
+      - code-server-workspaces:/data/workspaces
+      - code-server-tailscale:/var/lib/tailscale
+    environment:
+      - PUID=503
+      - PGID=20
+      - TZ
+      - DOCKER_MODS=ghcr.io/tailscale-dev/docker-mod:main
+      - TAILSCALE_HOSTNAME=code
+      - TAILSCALE_STATE_DIR=/var/lib/tailscale
+      - TAILSCALE_USE_SSH=1
+      - TAILSCALE_AUTHKEY=$CODE_SERVER_TAILSCALE_AUTH_KEY
+      - PROXY_DOMAIN=code.$DOMAIN_NAME #optional
+      - DEFAULT_WORKSPACE=/data/workspaces #optional
+    networks:
+      traefik-proxy:
+
+  portainer:
+    container_name: portainer
+    image: portainer/portainer-ce:latest
+    command: -H tcp://docker-proxy:2375
+    volumes:
+      # - /var/run/docker.sock:/var/run/docker.sock
+      - portainer-data:/data
+    labels:
+      - traefik.enable=true
+      ## HTTP Routers
+      - traefik.http.routers.portainer-rtr.entrypoints=https
+      - traefik.http.routers.portainer-rtr.rule=Host(`portainer.$DOMAIN_NAME`)
+      ## HTTP Services
+      - traefik.http.routers.portainer-rtr.service=portainer-svc
+      - traefik.http.services.portainer-svc.loadbalancer.server.port=9000
+    restart: unless-stopped
+    networks:
+      traefik-proxy:
+      docker-proxy:
+
+  uptime-kuma:
+    container_name: uptime-kuma
+    # A container that exposes an API to show its IP address
+    image: louislam/uptime-kuma:latest
+    volumes:
+      - uptime-kuma-data:/app/data
+    labels:
+      - traefik.enable=true
+      ## HTTP Routers
+      - traefik.http.routers.uptime-kuma-rtr.entrypoints=https
+      - traefik.http.routers.uptime-kuma-rtr.rule=Host(`uptime.$DOMAIN_NAME`) || Host(`status.$DOMAIN_NAME`)
+      ## HTTP Services
+      - traefik.http.routers.uptime-kuma-rtr.service=uptime-kuma-svc
+      - traefik.http.services.uptime-kuma-svc.loadbalancer.server.port=3001
+    restart: unless-stopped
+    networks:
+      traefik-proxy:
+      docker-proxy:
+
+  certdumper:
+    image: ghcr.io/kereis/traefik-certs-dumper:latest
+    volumes:
+      - ./apps/traefik:/traefik:ro
+      - ./shared/certs:/output:rw
+    restart: unless-stopped
+
+networks:
+  traefik-proxy:
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.101.100.0/23
+          gateway: 10.101.100.1
+  docker-proxy:
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.101.254.0/24
+          gateway: 10.101.254.1
+  cf-tunnel: {}
+  ts-relay:
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.101.110.0/24
+          gateway: 10.101.110.1

@@ -1,0 +1,13 @@
+http:
+  routers:
+    ha-rtr:
+      rule: "Host(`ha.chalk-playground.space`)"
+      entryPoints:
+        - https
+      service: ha-svc
+
+  services:
+    ha-svc:
+      loadBalancer:
+        servers:
+          - url: "http://10.0.4.3:8123"
